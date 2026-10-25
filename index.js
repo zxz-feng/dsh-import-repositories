@@ -54,9 +54,27 @@ async function runGit(ctx, executable, args, cwd, signal, maxBytes = OUTPUT_MAX_
 		},
 		graceMs: TERMINATE_GRACE_MS,
 		signal: combined,
-		// GIT_TERMINAL_PROMPT=0 keeps a missing credential from hanging the tool;
-		// the bounded output protects the Host from a runaway diff.
-		env: { GIT_TERMINAL_PROMPT: '0', GIT_OPTIONAL_LOCKS: '0', LC_ALL: 'C' },
+		// Keep a missing credential from ever reaching an interactive prompt.
+		//
+		// GIT_TERMINAL_PROMPT=0 only suppresses git's own stdin question. On
+		// Windows the credential is usually requested by a helper (Git Credential
+		// Manager), and a helper can open a GUI dialog instead of reading stdin —
+		// which shows up as a popup the user did not ask for. Two more variables
+		// close that path: an empty GIT_ASKPASS is not consulted when a helper is
+		// configured, and GCM_INTERACTIVE=Never makes GCM itself refuse to draw a
+		// window and fail instead. Together they turn "wait for a human" into a
+		// fast, reportable error.
+		//
+		// GIT_OPTIONAL_LOCKS=0 keeps read-only commands from taking the index lock,
+		// and the bounded output protects the Host from a runaway diff.
+		env: {
+			GIT_TERMINAL_PROMPT: '0',
+			GIT_ASKPASS: '',
+			SSH_ASKPASS: '',
+			GCM_INTERACTIVE: 'Never',
+			GIT_OPTIONAL_LOCKS: '0',
+			LC_ALL: 'C',
+		},
 	});
 	const outcome = await handle.done;
 	const stdout = handle.collected.stdout?.readFrom(0) ?? { text: '', lossy: false };
@@ -117,6 +135,86 @@ const textOutput = {
 	schema: { type: 'string' },
 	render: (_args, value) => [{ type: 'text', text: value }],
 };
+
+//#region hosting helpers
+// Platform detection exists for one reason: credential behaviour differs enough
+// that the wrong transport turns a plain push into a blocking dialog.
+// A Gitee/Aliyun HTTPS push always demands a username and password, and on
+// Windows that prompt is a Git Credential Manager window — which is exactly the
+// failure this plugin exists to avoid. SSH either works or fails fast.
+
+/**
+ * Hosts where an HTTPS push reliably needs interactive credentials, so SSH is
+ * the transport that can succeed unattended.
+ */
+const SSH_PREFERRED_HOSTS = ['gitee.com', 'gitcode.com', 'codeup.aliyun.com', 'gitlab.com'];
+
+/**
+ * Hosts that publish HTTPS URLs which work without a credential prompt for
+ * public repositories.
+ */
+const PUBLIC_CLONE_HOSTS = ['github.com'];
+
+/**
+ * Extract the lower-cased host of an HTTPS/SSH git URL.
+ * @param url - a git remote URL.
+ * @returns the host, or an empty string when it cannot be determined.
+ */
+function hostOf(url) {
+	const text = url.trim();
+	// scp-like syntax: git@host:owner/repo.git
+	const scp = /^[^@/\s]+@([^:/\s]+):/.exec(text);
+	if (scp !== null) return (scp[1] ?? '').toLowerCase();
+	try {
+		return new URL(text).hostname.toLowerCase();
+	} catch {
+		return '';
+	}
+}
+
+/**
+ * Convert an HTTPS repository URL to its SSH equivalent on the same host.
+ * @param url - an https:// URL.
+ * @returns the `git@host:owner/repo(.git)` form, or undefined when the input is
+ *   not an HTTPS URL with a usable path.
+ */
+function httpsToSsh(url) {
+	let parsed;
+	try {
+		parsed = new URL(url.trim());
+	} catch {
+		return undefined;
+	}
+	if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') return undefined;
+	const host = parsed.hostname;
+	// A port usually means a self-hosted instance with a non-standard SSH setup,
+	// so rewriting it here would guess at the wrong endpoint.
+	if (parsed.port !== '') return undefined;
+	const path = parsed.pathname.replace(/^\/+/, '').replace(/\/+$/, '');
+	if (path === '') return undefined;
+	// Every supported host serves SSH on the standard 22 with the git account.
+	return `git@${host}:${path.endsWith('.git') ? path : `${path}.git`}`;
+}
+
+/**
+ * Describe how a push to this URL will authenticate, so a caller can pick a
+ * transport before anything blocks.
+ * @param url - a git remote URL.
+ * @returns one human sentence, or an empty string for a local path.
+ */
+function transportNote(url) {
+	const text = url.trim();
+	if (text === '' || /^(file:\/\/|[A-Za-z]:[\\/]|\/|\.)/.test(text)) return '';
+	const host = hostOf(text);
+	const isSsh = /^[^@/\s]+@[^:/\s]+:/.test(text) || text.startsWith('ssh://');
+	if (isSsh) return `ssh transport to ${host || 'the remote'} (no credential prompt; needs an SSH key)`;
+	if (SSH_PREFERRED_HOSTS.includes(host)) {
+		return `HTTPS transport to ${host}: this host asks for a username and password on push, which opens a credential prompt. Prefer preferSsh=true`;
+	}
+	if (PUBLIC_CLONE_HOSTS.includes(host)) return `HTTPS transport to ${host} (works unattended when the repository accepts your stored credential)`;
+	return `HTTPS transport to ${host || 'the remote'}`;
+}
+//#endregion
 
 /**
  * Register the git tools.
@@ -304,9 +402,12 @@ export function apply(ctx) {
 				if (args.all !== true && paths.length === 0) {
 					throw new Error('pass `all: true` or at least one path in `paths`');
 				}
-				const argv = args.unstage === true ? ['reset', '--'] : ['add', '--'];
+				// `--` separates pathspecs from options, so it has to come AFTER every
+				// option: `git add -- --all` treats "--all" as a literal path and fails
+				// with "pathspec '--all' did not match any files".
+				const argv = [args.unstage === true ? 'reset' : 'add'];
 				if (args.all === true && args.unstage !== true) argv.push('--all');
-				argv.push(...paths);
+				if (paths.length > 0) argv.push('--', ...paths);
 				expectOk(await runGit(ctx, executable, argv, root, exec.signal), `git ${argv[0]}`);
 
 				const status = await runGit(ctx, executable, ['status', '--short'], root, exec.signal);
@@ -380,7 +481,7 @@ export function apply(ctx) {
 				const result = await runGit(ctx, executable, argv, root, exec.signal, OUTPUT_MAX_BYTES, NETWORK_TIMEOUT_MS);
 				if (result.exitCode !== 0) {
 					const detail = result.stderr.trim() || result.stdout.trim();
-					throw new Error(`git push failed: ${detail}`);
+					throw new Error(`git push failed: ${await networkFailure(executable, root, remote, detail, exec.signal)}`);
 				}
 				return `pushed ${branch} to ${remote}\n${result.stdout.trim()}`;
 			},
@@ -408,7 +509,7 @@ export function apply(ctx) {
 				const result = await runGit(ctx, executable, argv, root, exec.signal, OUTPUT_MAX_BYTES, NETWORK_TIMEOUT_MS);
 				if (result.exitCode !== 0) {
 					const detail = result.stderr.trim() || result.stdout.trim();
-					throw new Error(`git fetch failed: ${detail}`);
+					throw new Error(`git fetch failed: ${await networkFailure(executable, root, remote, detail, exec.signal)}`);
 				}
 
 				const upstream = await runGit(
@@ -453,13 +554,302 @@ export function apply(ctx) {
 				const result = await runGit(ctx, executable, argv, root, exec.signal, OUTPUT_MAX_BYTES, NETWORK_TIMEOUT_MS);
 				if (result.exitCode !== 0) {
 					const detail = [result.stdout.trim(), result.stderr.trim()].filter((part) => part !== '').join('\n');
-					throw new Error(`git pull failed: ${detail}`);
+					throw new Error(`git pull failed: ${await networkFailure(executable, root, remote, detail, exec.signal)}`);
 				}
 				return result.stdout.trim() || 'already up to date';
 			},
 			presentCall: (args) => ({ card: 'generic', title: 'Git pull', kind: 'other', rawInput: args }),
 		}),
 	);
+
+	/**
+	 * Explain a network failure whose real cause is the transport.
+	 *
+	 * Gitee and GitCode reject an unattended HTTPS push: the request needs a
+	 * username and password, and on Windows git hands that question to a
+	 * credential dialog. Nothing in git's own message says so, so the remedy is
+	 * appended here rather than left to the caller.
+	 *
+	 * @param executable - resolved git executable.
+	 * @param root - work tree root.
+	 * @param remote - remote name that failed.
+	 * @param detail - git's own diagnostic.
+	 * @param signal - cancellation.
+	 * @returns the detail, plus a concrete remedy when one applies.
+	 */
+	const networkFailure = async (executable, root, remote, detail, signal) => {
+		const url = await runGit(ctx, executable, ['remote', 'get-url', remote], root, signal);
+		if (url.exitCode !== 0) return detail;
+		const remoteUrl = url.stdout.trim();
+		const host = hostOf(remoteUrl);
+		const overHttps = remoteUrl.startsWith('https://') || remoteUrl.startsWith('http://');
+		if (!overHttps || !SSH_PREFERRED_HOSTS.includes(host)) return detail;
+		return (
+			`${detail}\n\n` +
+			`Hint: ${host} asks for a username and password over HTTPS, which cannot be answered unattended.\n` +
+			`Repoint this remote at SSH first, then retry:\n` +
+			`  git_remote action=set-url name=${remote} url=${remoteUrl} preferSsh=true\n` +
+			`  git_push remote=${remote}`
+		);
+	};
+
+	//#region remote management
+	// Without these two tools the agent can only push to a remote somebody else
+	// configured. "Push my local project to GitHub/Gitee/GitCode" starts here.
+
+	/**
+	 * Read every configured remote and its fetch URL.
+	 * @param executable - resolved git executable.
+	 * @param root - work tree root.
+	 * @param signal - cancellation.
+	 * @returns ordered [name, url] pairs.
+	 */
+	const listRemotes = async (executable, root, signal) => {
+		const names = await runGit(ctx, executable, ['remote'], root, signal);
+		if (names.exitCode !== 0) return [];
+		const result = [];
+		for (const name of names.stdout.split('\n').map((line) => line.trim()).filter((line) => line !== '')) {
+			const url = await runGit(ctx, executable, ['remote', 'get-url', name], root, signal);
+			result.push([name, url.exitCode === 0 ? url.stdout.trim() : '']);
+		}
+		return result;
+	};
+
+	ctx.tools.register(
+		defineTool({
+			name: 'git_remote',
+			description:
+				'List, add, or repoint git remotes. Use this first when a local project has no remote yet: `action: "add"` with a name and url connects it to GitHub, Gitee, or GitCode, then git_push can send the branch. `action: "list"` reports every remote with its URL and how that URL will authenticate. `action: "set-url"` repoints an existing remote. Set `preferSsh: true` on add/set-url to rewrite an HTTPS URL into its SSH form, which is the reliable path for Gitee because its HTTPS push always demands a credential prompt.',
+			parameters: {
+				cwd: { type: 'string', description: 'Repository directory; defaults to the Session working directory.' },
+				action: {
+					type: 'string',
+					description: 'What to do: "list" (default), "add", or "set-url".',
+				},
+				name: { type: 'string', description: 'Remote name, for example "origin", "github", "gitee". Defaults to "origin" for add/set-url.' },
+				url: { type: 'string', description: 'Remote URL for add/set-url, for example https://gitee.com/you/repo.git or git@github.com:you/repo.git.' },
+				preferSsh: { type: 'boolean', description: 'Rewrite an HTTPS url to its SSH form before writing it. Recommended for Gitee and GitCode.' },
+			},
+			output: textOutput,
+			async execute(args, exec) {
+				const { executable, root } = await target(exec, args);
+				const signal = exec.signal;
+				const action = typeof args.action === 'string' && args.action.trim() !== '' ? args.action.trim().toLowerCase() : 'list';
+
+				if (action === 'list') {
+					const remotes = await listRemotes(executable, root, signal);
+					if (remotes.length === 0) {
+						return [
+							'no remotes configured',
+							'',
+							'Connect this repository with:',
+							'  git_remote action=add url=https://github.com/you/repo.git',
+							'  git_remote action=add url=https://gitee.com/you/repo.git preferSsh=true',
+						].join('\n');
+					}
+					const lines = [`${remotes.length} remote(s):`];
+					for (const [name, url] of remotes) {
+						const note = transportNote(url);
+						lines.push(`  ${name.padEnd(12)} ${url}${note === '' ? '' : `\n               ${note}`}`);
+					}
+					return lines.join('\n');
+				}
+
+				if (action !== 'add' && action !== 'set-url') {
+					throw new Error(`unknown action "${action}": expected "list", "add", or "set-url"`);
+				}
+
+				const name = typeof args.name === 'string' && args.name.trim() !== '' ? args.name.trim() : 'origin';
+				// git's own ref rules for a remote name: no whitespace, no path separators.
+				if (!/^[A-Za-z0-9._-]+$/.test(name)) {
+					throw new Error(`invalid remote name "${name}": use letters, digits, dot, underscore, or dash`);
+				}
+
+				const rawUrl = typeof args.url === 'string' ? args.url.trim() : '';
+				if (rawUrl === '') throw new Error('pass `url` for action "add" or "set-url"');
+				// A remote name is not a URL. Catching it here gives a useful message
+				// instead of git's "does not appear to be a git repository".
+				if (!/^(https?:\/\/|git@|ssh:\/\/|file:\/\/|\/|[A-Za-z]:[\\/]|\.{1,2}[\\/])/.test(rawUrl)) {
+					throw new Error(
+						`\`url\` expects a repository URL, not a name: ${rawUrl}\n` +
+							'  example: https://github.com/you/repo.git\n' +
+							'  example: git@github.com:you/repo.git\n' +
+							'Nothing was changed.',
+					);
+				}
+
+				let url = rawUrl;
+				const notes = [];
+				if (args.preferSsh === true) {
+					const ssh = httpsToSsh(rawUrl);
+					if (ssh === undefined) {
+						// Already SSH, or a form that cannot be rewritten safely. Say so,
+						// and keep the URL the caller gave rather than guessing.
+						notes.push(rawUrl.startsWith('https://') || rawUrl.startsWith('http://') ? 'preferSsh: this URL cannot be rewritten (non-standard port or path); kept as given' : 'preferSsh: this URL is already SSH or is a local path; kept as given');
+					} else {
+						url = ssh;
+						notes.push(`preferSsh: rewrote ${rawUrl} -> ${ssh}`);
+					}
+				}
+
+				const existing = await listRemotes(executable, root, signal);
+				const known = existing.map(([remoteName]) => remoteName);
+
+				// `add` on an existing name fails in git; report the truth and the fix
+				// instead of silently converting an add into a set-url.
+				if (action === 'add' && known.includes(name)) {
+					const current = existing.find(([remoteName]) => remoteName === name)?.[1] ?? '';
+					throw new Error(
+						`remote "${name}" already exists -> ${current}\n` +
+							`Use action: "set-url" to repoint it, or pick another name.\nNothing was changed.`,
+					);
+				}
+				if (action === 'set-url' && !known.includes(name)) {
+					const body = known.length === 0 ? 'This repository has no remotes.' : `Configured remotes: ${known.join(', ')}`;
+					throw new Error(`remote "${name}" does not exist, so there is nothing to repoint.\n${body}\nUse action: "add" first.`);
+				}
+
+				const argv = action === 'add' ? ['remote', 'add', name, url] : ['remote', 'set-url', name, url];
+				expectOk(await runGit(ctx, executable, argv, root, signal), `git remote ${action}`);
+
+				const report = [
+					`${action === 'add' ? 'added' : 'repointed'} remote "${name}" -> ${url}`,
+					...notes,
+					'',
+					`repository: ${root}`,
+				];
+				const note = transportNote(url);
+				if (note !== '') report.push(`transport: ${note}`);
+				if (action === 'add') {
+					const current = await runGit(ctx, executable, ['branch', '--show-current'], root, signal);
+					const branch = current.stdout.trim();
+					report.push(
+						'',
+						branch === ''
+							? 'Next: create a branch (git_branch action=create) then push it.'
+							: `Next: git_push branch=${branch} setUpstream=true`,
+					);
+				}
+				return report.join('\n');
+			},
+			presentCall: (args) => ({ card: 'generic', title: 'Git remote', kind: 'other', rawInput: args }),
+		}),
+	);
+
+	ctx.tools.register(
+		defineTool({
+			name: 'git_branch',
+			description:
+				'List, create, switch, rename, or delete git branches. Create a branch before pushing work that should not land on the main branch. Deletion refuses unmerged branches unless `force: true`, so no commits are lost silently. Switching is refused while the working tree has changes that would be overwritten.',
+			parameters: {
+				cwd: { type: 'string', description: 'Repository directory; defaults to the Session working directory.' },
+				action: {
+					type: 'string',
+					description: 'What to do: "list" (default), "create", "switch", "delete", or "rename".',
+				},
+				name: { type: 'string', description: 'Branch to create, switch to, delete, or rename.' },
+				from: { type: 'string', description: 'Start point for create, for example "main" or a commit hash. Defaults to the current HEAD.' },
+				newName: { type: 'string', description: 'New name for action "rename".' },
+				force: { type: 'boolean', description: 'For delete: remove the branch even when it has unmerged commits.' },
+				remote: { type: 'boolean', description: 'For list: include remote-tracking branches.' },
+			},
+			output: textOutput,
+			async execute(args, exec) {
+				const { executable, root } = await target(exec, args);
+				const signal = exec.signal;
+				const action = typeof args.action === 'string' && args.action.trim() !== '' ? args.action.trim().toLowerCase() : 'list';
+
+				if (action === 'list') {
+					const argv = ['branch', '--format=%(refname:short)\t%(upstream:short)\t%(objectname:short)\t%(contents:subject)'];
+					if (args.remote === true) argv.push('--all');
+					const listed = expectOk(await runGit(ctx, executable, argv, root, signal), 'git branch');
+					const rows = listed.stdout.split('\n').map((row) => row.trimEnd()).filter((row) => row !== '');
+					if (rows.length === 0) return 'no branches yet: this repository has no commits';
+					const current = (await runGit(ctx, executable, ['branch', '--show-current'], root, signal)).stdout.trim();
+					const lines = [`${rows.length} branch(es), current: ${current === '' ? '(detached HEAD)' : current}`, ''];
+					for (const row of rows) {
+						const [branchName, upstream, hash, ...subject] = row.split('\t');
+						const marker = branchName === current ? '*' : ' ';
+						const track = upstream === undefined || upstream === '' ? '' : ` -> ${upstream}`;
+						lines.push(`${marker} ${(branchName ?? '').padEnd(24)} ${(hash ?? '?').padEnd(9)}${track}  ${subject.join('\t')}`);
+					}
+					return lines.join('\n');
+				}
+
+				// Every write path needs a branch name that git will accept.
+				const rawName = typeof args.name === 'string' ? args.name.trim() : '';
+				if (rawName === '') throw new Error(`action "${action}" requires \`name\``);
+
+				if (action === 'create') {
+					const from = typeof args.from === 'string' && args.from.trim() !== '' ? args.from.trim() : '';
+					// -c gives git's own ref validation, so a bad name is rejected before
+					// anything is created.
+					const checked = await runGit(ctx, executable, ['check-ref-format', '--branch', rawName], root, signal);
+					if (checked.exitCode !== 0) throw new Error(`git rejects this as a branch name: ${rawName}`);
+					const exists = await runGit(ctx, executable, ['rev-parse', '--verify', '--quiet', `refs/heads/${rawName}`], root, signal);
+					if (exists.exitCode === 0) {
+						throw new Error(`branch "${rawName}" already exists. Switch to it with action: "switch".`);
+					}
+					const argv = from === '' ? ['branch', rawName] : ['branch', rawName, from];
+					expectOk(await runGit(ctx, executable, argv, root, signal), 'git branch');
+					return [
+						`created branch ${rawName}${from === '' ? '' : ` from ${from}`}`,
+						'',
+						'The new branch is not checked out and has no upstream yet.',
+						`Next: git_push branch=${rawName} setUpstream=true`,
+						`      git_branch action=switch name=${rawName}`,
+					].join('\n');
+				}
+
+				if (action === 'switch') {
+					const result = await runGit(ctx, executable, ['checkout', rawName], root, signal);
+					if (result.exitCode !== 0) {
+						throw new Error(`git checkout failed: ${result.stderr.trim() || result.stdout.trim()}`);
+					}
+					const upstream = await runGit(ctx, executable, ['rev-parse', '--abbrev-ref', '--symbolic-full-name', '@{upstream}'], root, signal);
+					const upstreamName = upstream.exitCode === 0 ? upstream.stdout.trim() : '';
+					return [
+						`switched to ${rawName}`,
+						result.stderr.trim(),
+						upstreamName === '' ? 'no upstream configured for this branch' : `tracking ${upstreamName}`,
+					]
+						.filter((line) => line !== '')
+						.join('\n');
+				}
+
+				if (action === 'delete') {
+					const current = (await runGit(ctx, executable, ['branch', '--show-current'], root, signal)).stdout.trim();
+					if (current === rawName) {
+						throw new Error(`cannot delete "${rawName}": it is the checked-out branch. Switch to another branch first.`);
+					}
+					// The safe form is -d; -D is only reachable through force.
+					const argv = args.force === true ? ['branch', '-D', rawName] : ['branch', '-d', rawName];
+					const result = await runGit(ctx, executable, argv, root, signal);
+					if (result.exitCode !== 0) {
+						const detail = result.stderr.trim() || result.stdout.trim();
+						throw new Error(
+							`git branch delete failed: ${detail}\n` +
+								(args.force === true ? '' : 'The branch has commits that are not merged. Pass force: true to delete it anyway.'),
+						);
+					}
+					return `deleted branch ${rawName}${args.force === true ? ' (forced)' : ''}\n${result.stdout.trim()}`;
+				}
+
+				if (action === 'rename') {
+					const newName = typeof args.newName === 'string' ? args.newName.trim() : '';
+					if (newName === '') throw new Error('action "rename" requires `newName`');
+					const checked = await runGit(ctx, executable, ['check-ref-format', '--branch', newName], root, signal);
+					if (checked.exitCode !== 0) throw new Error(`git rejects this as a branch name: ${newName}`);
+					expectOk(await runGit(ctx, executable, ['branch', '-m', rawName, newName], root, signal), 'git branch -m');
+					return `renamed ${rawName} -> ${newName}`;
+				}
+
+				throw new Error(`unknown action "${action}": expected "list", "create", "switch", "delete", or "rename"`);
+			},
+			presentCall: (args) => ({ card: 'generic', title: 'Git branch', kind: 'other', rawInput: args }),
+		}),
+	);
+	//#endregion
 
 	//#region human slash commands
 	// These are the `/` commands a person types in the composer. They run the same
@@ -486,6 +876,8 @@ export function apply(ctx) {
 		'Tips:',
 		'  - The repository is the Session working directory. If it is not a repo,',
 		'    pass cwd=<path> pointing at one, or move the workspace to the repo root.',
+		'  - A value that contains spaces must be quoted:',
+		'      cwd="C:\\My Projects\\repo"   message="first release"   cwd=C:\\My\\ Projects\\repo',
 		'  - git-push never force-pushes.',
 		'  - git-name-set writes the identity GLOBALLY (git config --global), so it',
 		'    applies to every repository on this machine; the remote= target is written',
@@ -501,6 +893,77 @@ export function apply(ctx) {
 	const fail = (text) => ({ kind: 'error', text });
 
 	/**
+	 * Split one raw command input into shell-like words.
+	 *
+	 * The composer sends one flat string, so a path with a space cannot be told
+	 * apart from two arguments by splitting on whitespace. Two spellings let a
+	 * value keep its spaces:
+	 *
+	 *   cwd="C:\My Projects\repo"        double quotes
+	 *   cwd='C:\My Projects\repo'        single quotes
+	 *   cwd=C:\My\ Projects\repo         backslash-escaped spaces
+	 *
+	 * Quotes are removed and their content kept verbatim; backslashes are only
+	 * treated as escapes when they precede a space, a quote, or another backslash,
+	 * so a Windows path like C:\Users\me survives unchanged.
+	 *
+	 * @param rawInput - text following the command name.
+	 * @returns the words, with quoting resolved.
+	 */
+	const tokenize = (rawInput) => {
+		const words = [];
+		let current = '';
+		let started = false;
+		let quote = '';
+		const text = rawInput.trim();
+		for (let index = 0; index < text.length; index += 1) {
+			const char = text[index];
+			if (quote !== '') {
+				if (char === quote) {
+					quote = '';
+					continue;
+				}
+				current += char;
+				started = true;
+				continue;
+			}
+			// A quote opens a quoted run when it starts a word OR follows `=` as the
+			// start of an option value, so `cwd="C:\My Projects\repo"` works while
+			// mid-word punctuation like `it's` stays literal — a commit message must
+			// never lose an apostrophe.
+			if ((char === '"' || char === "'") && (!started || current.endsWith('='))) {
+				quote = char;
+				started = true;
+				continue;
+			}
+			if (char === '\\' && index + 1 < text.length) {
+				const next = text[index + 1];
+				// Only these three make a backslash an escape; otherwise it is literal.
+				if (next === ' ' || next === '"' || next === "'" || next === '\\') {
+					current += next;
+					started = true;
+					index += 1;
+					continue;
+				}
+			}
+			if (char === ' ' || char === '\t' || char === '\n' || char === '\r') {
+				if (started) {
+					words.push(current);
+					current = '';
+					started = false;
+				}
+				continue;
+			}
+			current += char;
+			started = true;
+		}
+		// An unterminated quote keeps what was collected rather than dropping it;
+		// the caller then sees the literal text instead of an empty value.
+		if (started) words.push(current);
+		return words;
+	};
+
+	/**
 	 * Split one raw command input into flags and a free-text remainder.
 	 * @param rawInput - text following the command name.
 	 * @param flags - flag names taking no value.
@@ -511,7 +974,7 @@ export function apply(ctx) {
 		const present = new Set();
 		const options = new Map();
 		const words = [];
-		for (const word of rawInput.trim().split(/\s+/)) {
+		for (const word of tokenize(rawInput)) {
 			if (word === '') continue;
 			if (flags.includes(word)) {
 				present.add(word);
@@ -763,7 +1226,7 @@ export function apply(ctx) {
 				const result = await runGit(ctx, resolved.executable, argv, resolved.root, resolved.signal, OUTPUT_MAX_BYTES, NETWORK_TIMEOUT_MS);
 				if (result.exitCode !== 0) {
 					const detail = [result.stdout.trim(), result.stderr.trim()].filter((part) => part !== '').join('\n');
-					return fail(`git pull failed: ${detail}`);
+					return fail(`git pull failed: ${await networkFailure(resolved.executable, resolved.root, remote, detail, resolved.signal)}`);
 				}
 				return ok(result.stdout.trim() || 'already up to date');
 			},
@@ -784,7 +1247,7 @@ export function apply(ctx) {
 				const result = await runGit(ctx, resolved.executable, argv, resolved.root, resolved.signal, OUTPUT_MAX_BYTES, NETWORK_TIMEOUT_MS);
 				if (result.exitCode !== 0) {
 					const detail = result.stderr.trim() || result.stdout.trim();
-					return fail(`git fetch failed: ${detail}`);
+					return fail(`git fetch failed: ${await networkFailure(resolved.executable, resolved.root, remote, detail, resolved.signal)}`);
 				}
 				const lines = [`fetched ${remote}`];
 				const counts = await runGit(
@@ -1042,11 +1505,12 @@ export function apply(ctx) {
 						[
 							`Too many arguments: ${words.map((word) => `"${word}"`).join(' ')}`,
 							'',
-							'Option values may not contain spaces, so `message=first release`',
-							'arrives here as the two words `message=first` and `release`.',
+							'An option value that contains spaces must be quoted:',
+							'  message="first release"',
 							'',
 							'  /git-tag v1.0.0 [<remote>] [message=<text>] [rev=<rev>]',
 							'  /git-tag v1.0.0 message=first-release',
+							'  /git-tag v1.0.0 message="first release"',
 						].join('\n'),
 					);
 				}
@@ -1094,8 +1558,8 @@ export function apply(ctx) {
 							'',
 							knownRemotes.length === 0 ? 'This repository has no remotes configured.' : `Configured remotes: ${knownRemotes.join(', ')}`,
 							'',
-							'If that word was meant to be part of an option value, note that values',
-							'may not contain spaces: `message=first release` is two separate words.',
+							'If that word was meant to be part of an option value, quote it:',
+							'`message="first release"` keeps the spaces in one value.',
 							'',
 							`  /git-tag ${version === '' ? '--push' : version} ${knownRemotes[0] ?? 'origin'}`,
 						].join('\n'),

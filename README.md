@@ -84,11 +84,30 @@ agent 的 shell 运行在 `workspace-write` 文件沙箱里，实测该环境**�
 | `git_log` | 最近提交列表 | 否 |
 | `git_stage` | 暂存或取消暂存（`all` 或指定路径） | 否 |
 | `git_commit` | 创建提交（支持 `all`、`amend`） | 否 |
+| `git_remote` | 列出 / 添加 / 改写远端，并说明其认证方式 | 否 |
+| `git_branch` | 列出 / 创建 / 切换 / 重命名 / 删除分支 | 否 |
 | `git_fetch` | 抓取远端并报告 ahead/behind | **是** |
 | `git_pull` | 抓取并集成（支持 `rebase`） | **是** |
 | `git_push` | 推送到远端（支持 `set-upstream`） | **是** |
 
 所有工具都接受可选 `cwd`，默认使用当前会话的工作目录。
+
+### `git_remote`
+
+`action: list | add | set-url`
+
+- `list`（默认）列出每个远端、它的 URL，以及**这个 URL 会怎样认证**——即一次推送会不会弹凭据框。
+- `add` 在名字已存在时拒绝，并指出改用 `set-url`；`set-url` 在远端不存在时拒绝。把远端名当 URL 传也会被拒绝并给出示例。
+- `preferSsh: true` 会把 HTTPS URL 改写为同主机的 SSH 形式：
+  `https://gitee.com/u/r.git` → `git@gitee.com:u/r.git`。带非标准端口、路径无法安全改写的 URL 会**原样保留并说明原因**，不会硬改。
+
+加好远端后，输出会直接给出下一步该敲的命令。
+
+### `git_branch`
+
+`action: list | create | switch | delete | rename`
+
+删除默认走 `git branch -d`（安全形式）：未合并的分支会被拒绝，并提示需要 `force: true` 才改用 `-D`。删除当前已检出的分支会被直接拒绝。`create` 与 `rename` 都会先过 `git check-ref-format`，非法名字进不到 git。
 
 ## 提供的斜杠命令（人类使用）
 
@@ -135,7 +154,18 @@ agent 的 shell 运行在 `workspace-write` 文件沙箱里，实测该环境**�
 | 默认值 | 省略时使用**当前会话的工作目录** |
 | 写法 | `cwd=D:\path\to\repo` 或 `cwd=D:/path/to/repo`（两种斜杠都行） |
 | 必须是仓库 | 目录不是 git 仓库时会明确报错，**不会静默失败** |
-| 路径含空格 | 目前**不支持**（解析按空格分词），请避免 |
+| 路径含空格 | **支持**，把值用引号包起来即可（见下） |
+
+**值里含空格时加引号**：
+
+```
+/git-status cwd="D:\My Projects\repo"
+/git-commit "a message with spaces" cwd="D:\My Projects\repo"
+```
+
+单引号等价；也可以只转义空格本身：`cwd=D:\My\ Projects\repo`。
+
+只有出现在**词首**或**紧跟 `=` 之后**的引号才会开启引用，所以 `it's` 这种词中间的撇号会原样保留，不会被当成引号吞掉。
 
 **什么情况下必须写 `cwd=`：**
 
